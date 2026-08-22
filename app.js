@@ -15,6 +15,14 @@ let state = {
   serverMembersCache: {}, // userId -> profile, for message rendering
   currentRoles: [],
   myPermissions: {}, // permissões do usuário no servidor atual (dono = tudo true)
+
+  mode: "server", // "server" | "dm"
+  friends: [],
+  incomingRequests: [],
+  outgoingRequests: [],
+  currentDmUserId: null,
+  unreadDm: new Set(), // userIds com mensagem nova ainda não vista
+  voiceContext: null, // { type: "channel"|"dm", id } — sala de voz ativa no momento
 };
 
 // ============================================
@@ -126,6 +134,8 @@ async function onLoggedIn(user){
   $("main-screen").classList.add("active");
   renderUserBar();
   await loadServers();
+  subscribeToDmInbox();
+  await loadFriendsAndRequests();
 }
 
 $("btn-logout").addEventListener("click", async () => {
@@ -474,8 +484,14 @@ $("btn-join-server").addEventListener("click", async () => {
 
 async function selectServer(serverId){
   if(voiceState.channel) leaveVoiceChannel();
+  state.mode = "server";
   state.currentServerId = serverId;
   state.currentChannelId = null;
+  $("btn-dm-home").classList.remove("active");
+  $("dm-sidebar-content").style.display = "none";
+  $("server-sidebar-content").style.display = "flex";
+  $("dm-view").style.display = "none";
+  $("btn-toggle-members").style.display = "";
   renderServerRail();
 
   const server = state.servers.find(s => s.id === serverId);
@@ -566,6 +582,309 @@ function renderMemberList(members, roles){
   if(!members.length){
     panel.innerHTML = `<h3>Membros — 0</h3>`;
   }
+}
+
+// ============================================
+// AMIGOS E MENSAGENS DIRETAS (DM)
+// ============================================
+$("btn-dm-home").addEventListener("click", enterDmMode);
+
+function enterDmMode(){
+  if(voiceState.channel && state.voiceContext && state.voiceContext.type === "channel") leaveVoiceChannel();
+  state.mode = "dm";
+  state.currentServerId = null;
+  renderServerRail();
+  $("btn-dm-home").classList.add("active");
+  $("server-sidebar-content").style.display = "none";
+  $("dm-sidebar-content").style.display = "flex";
+  $("btn-toggle-members").style.display = "none";
+  $("member-list-panel").classList.remove("active");
+
+  if(state.currentDmUserId){
+    openDm(state.currentDmUserId);
+  } else {
+    $("content-header").style.display = "none";
+    $("text-view").style.display = "none";
+    $("voice-view").style.display = "none";
+    $("dm-view").style.display = "none";
+    $("empty-state-text").textContent = "Selecione um amigo para conversar, ou adicione alguém pelo nome de usuário ao lado.";
+    $("empty-state").style.display = "flex";
+  }
+  loadFriendsAndRequests();
+}
+
+async function loadFriendsAndRequests(){
+  const myId = state.user.id;
+  const { data: rows, error } = await sb.from("friend_requests")
+    .select("*")
+    .or(`from_user.eq.${myId},to_user.eq.${myId}`);
+  if(error){ console.error(error); return; }
+
+  const accepted = (rows || []).filter(r => r.status === "accepted");
+  const incoming = (rows || []).filter(r => r.status === "pending" && r.to_user === myId);
+  const outgoing = (rows || []).filter(r => r.status === "pending" && r.from_user === myId);
+
+  const friendIds = accepted.map(r => (r.from_user === myId ? r.to_user : r.from_user));
+  const otherIds = [...new Set([...friendIds, ...incoming.map(r => r.from_user), ...outgoing.map(r => r.to_user)])];
+
+  if(otherIds.length){
+    const { data: profiles } = await sb.from("profiles").select("*").in("id", otherIds);
+    (profiles || []).forEach(p => state.serverMembersCache[p.id] = p);
+  }
+
+  state.friends = friendIds;
+  state.incomingRequests = incoming;
+  state.outgoingRequests = outgoing;
+  renderFriendBadge();
+  if(state.mode === "dm") renderFriendsList();
+}
+
+function renderFriendBadge(){
+  const btn = $("btn-dm-home");
+  let dot = btn.querySelector(".dm-badge-dot");
+  const hasNotif = state.incomingRequests.length > 0 || state.unreadDm.size > 0;
+  if(hasNotif){
+    if(!dot){
+      dot = document.createElement("span");
+      dot.className = "dm-badge-dot";
+      btn.appendChild(dot);
+    }
+  } else if(dot){
+    dot.remove();
+  }
+}
+
+function renderFriendsList(){
+  const wrap = $("friend-list-wrap");
+  wrap.innerHTML = "";
+
+  if(state.incomingRequests.length){
+    const label = document.createElement("div");
+    label.className = "channel-group-label";
+    label.textContent = "Solicitações";
+    wrap.appendChild(label);
+
+    state.incomingRequests.forEach(r => {
+      const p = state.serverMembersCache[r.from_user] || { username: "Usuário" };
+      const row = document.createElement("div");
+      row.className = "friend-request-row";
+      row.innerHTML = `<div class="avatar" style="width:28px; height:28px; font-size:13px;">${avatarHtml(p)}</div>` +
+        `<span class="mname">${escapeHtml(displayName(p))}</span>` +
+        `<span class="friend-accept" title="Aceitar">✓</span>` +
+        `<span class="friend-decline" title="Recusar">✕</span>`;
+      row.querySelector(".friend-accept").addEventListener("click", () => respondFriendRequest(r.id, true));
+      row.querySelector(".friend-decline").addEventListener("click", () => respondFriendRequest(r.id, false));
+      wrap.appendChild(row);
+    });
+  }
+
+  const label2 = document.createElement("div");
+  label2.className = "channel-group-label";
+  label2.textContent = "Amigos — " + state.friends.length;
+  wrap.appendChild(label2);
+
+  if(!state.friends.length){
+    const empty = document.createElement("div");
+    empty.style.cssText = "color:var(--text-dim); font-size:13px; padding:4px 6px;";
+    empty.textContent = "Ninguém por aqui ainda.";
+    wrap.appendChild(empty);
+  }
+
+  state.friends
+    .map(id => state.serverMembersCache[id])
+    .filter(Boolean)
+    .sort((a, b) => a.username.localeCompare(b.username))
+    .forEach(p => {
+      const row = document.createElement("div");
+      row.className = "channel-item friend-row" + (state.currentDmUserId === p.id ? " active" : "");
+      row.innerHTML = `<div class="avatar" style="width:24px; height:24px; font-size:12px;">${avatarHtml(p)}</div>` +
+        `<span>${escapeHtml(displayName(p))}</span>` +
+        (state.unreadDm.has(p.id) ? `<span class="friend-unread-dot"></span>` : "");
+      row.addEventListener("click", () => openDm(p.id));
+      wrap.appendChild(row);
+    });
+
+  if(state.outgoingRequests.length){
+    const label3 = document.createElement("div");
+    label3.className = "channel-group-label";
+    label3.textContent = "Convites enviados";
+    wrap.appendChild(label3);
+    state.outgoingRequests.forEach(r => {
+      const p = state.serverMembersCache[r.to_user] || { username: "Usuário" };
+      const row = document.createElement("div");
+      row.style.cssText = "padding:6px 8px; font-size:13px; color:var(--text-dim);";
+      row.textContent = displayName(p) + " (aguardando resposta)";
+      wrap.appendChild(row);
+    });
+  }
+}
+
+async function respondFriendRequest(requestId, accept){
+  if(accept){
+    const { error } = await sb.from("friend_requests").update({ status: "accepted" }).eq("id", requestId);
+    if(error){ alert("Erro ao aceitar convite: " + error.message); return; }
+  } else {
+    await sb.from("friend_requests").delete().eq("id", requestId);
+  }
+  await loadFriendsAndRequests();
+}
+
+$("btn-send-friend-request").addEventListener("click", async () => {
+  const uname = $("add-friend-username").value.trim();
+  const errEl = $("friend-request-error");
+  errEl.textContent = "";
+  if(!uname) return;
+
+  const { data: profile, error: findError } = await sb.from("profiles")
+    .select("id, username").ilike("username", uname).maybeSingle();
+  if(findError || !profile){ errEl.textContent = "Nenhum usuário encontrado com esse nome."; return; }
+  if(profile.id === state.user.id){ errEl.textContent = "Você não pode adicionar a si mesmo."; return; }
+  if(state.friends.includes(profile.id)){ errEl.textContent = "Vocês já são amigos."; return; }
+
+  // Se a outra pessoa já te chamou, aceita na hora em vez de duplicar o pedido
+  const existingIncoming = state.incomingRequests.find(r => r.from_user === profile.id);
+  if(existingIncoming){
+    await respondFriendRequest(existingIncoming.id, true);
+    $("add-friend-username").value = "";
+    return;
+  }
+
+  const { error } = await sb.from("friend_requests").insert({ from_user: state.user.id, to_user: profile.id });
+  if(error){
+    errEl.textContent = (error.code === "23505") ? "Você já enviou um convite pra essa pessoa." : error.message;
+    return;
+  }
+  $("add-friend-username").value = "";
+  await loadFriendsAndRequests();
+});
+
+async function openDm(userId){
+  if(voiceState.channel && !(state.voiceContext && state.voiceContext.type === "dm" && state.voiceContext.id === userId)){
+    leaveVoiceChannel();
+  }
+  state.currentDmUserId = userId;
+  state.unreadDm.delete(userId);
+  renderFriendBadge();
+  if(state.mode === "dm") renderFriendsList();
+
+  $("empty-state").style.display = "none";
+  $("text-view").style.display = "none";
+  $("voice-view").style.display = "none";
+
+  const profile = state.serverMembersCache[userId] || { username: "Usuário" };
+  $("content-header").style.display = "flex";
+  $("content-header-title").textContent = "@" + (profile.username || "Usuário");
+  $("dm-view-toggle").style.display = "flex";
+  showDmMessagesView();
+
+  await loadDmMessages(userId);
+}
+
+// Identificador estável da "sala" de voz de uma conversa privada (mesmo par de pessoas = mesma sala)
+function dmRoomId(userIdA, userIdB){
+  return "dm-" + [userIdA, userIdB].sort().join("_");
+}
+
+function isCurrentDmCallActive(){
+  return !!(voiceState.channel && state.voiceContext && state.voiceContext.type === "dm" && state.voiceContext.id === state.currentDmUserId);
+}
+
+function showDmMessagesView(){
+  $("dm-view").style.display = "flex";
+  $("voice-view").style.display = "none";
+  $("btn-dm-tab-messages").classList.add("active");
+  $("btn-dm-tab-call").classList.remove("active");
+}
+
+function showDmCallView(){
+  $("dm-view").style.display = "none";
+  $("voice-view").style.display = "flex";
+  $("btn-dm-tab-messages").classList.remove("active");
+  $("btn-dm-tab-call").classList.add("active");
+
+  const friend = state.serverMembersCache[state.currentDmUserId] || { username: "Usuário" };
+  $("voice-channel-label").textContent = "Chamada com " + displayName(friend);
+
+  if(!isCurrentDmCallActive()){
+    $("voice-room").style.display = "none";
+    $("voice-join-prompt").style.display = "flex";
+  }
+}
+
+$("btn-dm-tab-messages").addEventListener("click", showDmMessagesView);
+$("btn-dm-tab-call").addEventListener("click", showDmCallView);
+
+async function loadDmMessages(otherUserId){
+  const myId = state.user.id;
+  const { data: messages, error } = await sb.from("dm_messages")
+    .select("*")
+    .or(`and(sender_id.eq.${myId},recipient_id.eq.${otherUserId}),and(sender_id.eq.${otherUserId},recipient_id.eq.${myId})`)
+    .order("created_at", { ascending: true })
+    .limit(200);
+  if(error){ console.error(error); return; }
+  renderDmMessages(messages || []);
+}
+
+function renderDmMessages(messages){
+  const wrap = $("dm-messages");
+  wrap.innerHTML = "";
+  messages.forEach(m => wrap.appendChild(dmMessageEl(m)));
+  wrap.scrollTop = wrap.scrollHeight;
+}
+
+function dmMessageEl(m){
+  const profile = state.serverMembersCache[m.sender_id] || { username: "Usuário" };
+  const el = document.createElement("div");
+  el.className = "msg";
+  const time = new Date(m.created_at).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  el.innerHTML = `
+    <div class="avatar" style="cursor:pointer;">${avatarHtml(profile)}</div>
+    <div class="msg-body">
+      <div class="msg-head">${escapeHtml(displayName(profile))} <span class="time">${time}</span></div>
+      <div class="msg-text"></div>
+    </div>`;
+  el.querySelector(".msg-text").textContent = m.content;
+  el.querySelector(".avatar").addEventListener("click", () => openProfileHub(m.sender_id));
+  return el;
+}
+
+async function sendDmMessage(){
+  const input = $("dm-message-text");
+  const content = input.value.trim();
+  if(!content || !state.currentDmUserId) return;
+  input.value = "";
+  const { data, error } = await sb.from("dm_messages").insert({
+    sender_id: state.user.id, recipient_id: state.currentDmUserId, content
+  }).select().single();
+  if(error){ alert("Erro ao enviar mensagem: " + error.message); return; }
+  $("dm-messages").appendChild(dmMessageEl(data));
+  $("dm-messages").scrollTop = $("dm-messages").scrollHeight;
+}
+
+$("btn-send-dm-message").addEventListener("click", sendDmMessage);
+$("dm-message-text").addEventListener("keydown", (e) => { if(e.key === "Enter") sendDmMessage(); });
+
+let dmInboxSub = null;
+function subscribeToDmInbox(){
+  if(dmInboxSub) return; // já ativa, uma inscrição basta pra toda a sessão
+  dmInboxSub = sb.channel("dm-inbox-" + state.user.id)
+    .on("postgres_changes", { event: "INSERT", schema: "public", table: "dm_messages", filter: `recipient_id=eq.${state.user.id}` },
+      async (payload) => {
+        const m = payload.new;
+        if(!state.serverMembersCache[m.sender_id]){
+          const { data: profile } = await sb.from("profiles").select("*").eq("id", m.sender_id).single();
+          if(profile) state.serverMembersCache[m.sender_id] = profile;
+        }
+        if(state.mode === "dm" && state.currentDmUserId === m.sender_id){
+          $("dm-messages").appendChild(dmMessageEl(m));
+          $("dm-messages").scrollTop = $("dm-messages").scrollHeight;
+        } else {
+          state.unreadDm.add(m.sender_id);
+          renderFriendBadge();
+          if(state.mode === "dm") renderFriendsList();
+        }
+      })
+    .subscribe();
 }
 
 // ============================================
@@ -888,6 +1207,7 @@ function selectChannel(channel){
   const header = $("content-header");
   header.style.display = "flex";
   $("content-header-title").textContent = (channel.type === "voice" ? "🎙️ " : "💬 ") + channel.name;
+  $("dm-view-toggle").style.display = "none";
 
   if(channel.type === "text"){
     $("text-view").style.display = "flex";
@@ -895,10 +1215,9 @@ function selectChannel(channel){
     loadMessages(channel.id);
     subscribeToMessages(channel.id);
   } else {
+    state.voiceContext = { type: "channel", id: channel.id };
     $("text-view").style.display = "none";
     $("voice-view").style.display = "flex";
-    $("voice-frame-wrap").style.display = "none";
-    $("voice-frame-wrap").innerHTML = "";
     $("voice-join-prompt").style.display = "flex";
     $("voice-channel-label").textContent = channel.name;
   }
@@ -1003,7 +1322,15 @@ let voiceState = {
   selectedMicId: localStorage.getItem("agora_mic_device") || null,
 };
 
-$("btn-join-voice").addEventListener("click", () => joinVoiceChannel(state.currentChannelId));
+$("btn-join-voice").addEventListener("click", () => {
+  if(state.mode === "dm" && state.currentDmUserId){
+    state.voiceContext = { type: "dm", id: state.currentDmUserId };
+    joinVoiceChannel(dmRoomId(state.user.id, state.currentDmUserId));
+  } else {
+    state.voiceContext = { type: "channel", id: state.currentChannelId };
+    joinVoiceChannel(state.currentChannelId);
+  }
+});
 $("btn-leave-voice").addEventListener("click", leaveVoiceChannel);
 $("btn-toggle-mute").addEventListener("click", () => {
   if(!voiceState.localStream) return;
@@ -1355,6 +1682,7 @@ function leaveVoiceChannel(){
   $("btn-toggle-mute").textContent = "🎤 Mutar";
   $("btn-toggle-camera").textContent = "📷 Ligar câmera";
   $("btn-share-screen").textContent = "🖥️ Compartilhar tela";
+  state.voiceContext = null;
 }
 
 // ============================================

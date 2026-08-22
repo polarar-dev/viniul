@@ -45,6 +45,25 @@
 
   .server-icon img{width:100%; height:100%; border-radius:inherit; object-fit:cover;}
 
+  .rail-separator{width:32px; height:2px; background:var(--bg-light); border-radius:1px; margin:2px 0; flex-shrink:0;}
+  #btn-dm-home{font-size:20px; position:relative;}
+  .dm-badge-dot{position:absolute; top:2px; right:2px; width:10px; height:10px; border-radius:50%; background:var(--danger); border:2px solid var(--bg-darkest);}
+
+  #dm-sidebar-content{flex-direction:column; flex:1; overflow:hidden;}
+  #dm-sidebar-header{padding:16px; font-weight:700; border-bottom:1px solid var(--bg-darkest); font-size:15px;}
+  #add-friend-row{display:flex; flex-direction:column; gap:8px; padding:12px 12px 0;}
+  #add-friend-row input{background:var(--bg-mid); border:1px solid var(--bg-light); border-radius:6px; color:var(--text); padding:8px 10px; font-size:13px; width:100%;}
+  #add-friend-row .btn{padding:9px 12px; font-size:13px;}
+  #friend-list-wrap{flex:1; overflow-y:auto; padding:6px 10px 10px;}
+  .friend-request-row{display:flex; align-items:center; gap:8px; padding:7px 6px; border-radius:6px;}
+  .friend-request-row:hover{background:var(--bg-light);}
+  .friend-request-row .mname{font-size:13px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;}
+  .friend-accept, .friend-decline{cursor:pointer; font-size:14px; padding:2px 4px;}
+  .friend-accept{color:var(--online);}
+  .friend-decline{color:var(--danger);}
+  .friend-row{position:relative;}
+  .friend-unread-dot{width:8px; height:8px; border-radius:50%; background:var(--danger); margin-left:auto; flex-shrink:0;}
+
   /* Channel sidebar */
   #channel-sidebar{width:232px; background:var(--bg-dark); display:flex; flex-direction:column;}
   #server-cover{width:100%; height:80px; background:linear-gradient(135deg,var(--accent),#4b3fa8); background-size:cover; background-position:center; flex-shrink:0; display:none;}
@@ -84,16 +103,16 @@
   #empty-state{flex:1; display:flex; align-items:center; justify-content:center; color:var(--text-dim); flex-direction:column; gap:10px;}
 
   /* Text channel view */
-  #text-view{flex:1; display:none; flex-direction:column; overflow:hidden;}
-  #messages{flex:1; overflow-y:auto; padding:16px 20px;}
+  #text-view, #dm-view{flex:1; display:none; flex-direction:column; overflow:hidden;}
+  #messages, #dm-messages{flex:1; overflow-y:auto; padding:16px 20px;}
   .msg{display:flex; gap:12px; margin-bottom:14px;}
   .msg .avatar{width:36px; height:36px; border-radius:50%; background:var(--bg-light); display:flex; align-items:center; justify-content:center; font-size:18px; flex-shrink:0;}
   .msg .msg-body .msg-head{font-size:14px; font-weight:600; margin-bottom:2px;}
   .msg .msg-body .msg-head .time{font-weight:400; color:var(--text-dim); font-size:11px; margin-left:6px;}
   .msg .msg-body .msg-text{font-size:14px; color:var(--text); line-height:1.4; word-break:break-word;}
-  #message-input-row{padding:14px 20px; display:flex; gap:10px;}
-  #message-input-row input{flex:1; background:var(--bg-light); border:none; border-radius:8px; padding:12px 14px; color:var(--text); font-size:14px;}
-  #message-input-row input:focus{outline:1px solid var(--accent);}
+  #message-input-row, #dm-message-input-row{padding:14px 20px; display:flex; gap:10px;}
+  #message-input-row input, #dm-message-input-row input{flex:1; background:var(--bg-light); border:none; border-radius:8px; padding:12px 14px; color:var(--text); font-size:14px;}
+  #message-input-row input:focus, #dm-message-input-row input:focus{outline:1px solid var(--accent);}
 
   /* Voice channel view */
   #voice-view{flex:1; display:none; flex-direction:column;}
@@ -172,17 +191,32 @@
   <!-- MAIN APP -->
   <div id="main-screen">
     <div id="server-rail">
+      <div class="server-icon" id="btn-dm-home" title="Mensagens diretas">💬</div>
+      <div class="rail-separator"></div>
       <div id="server-icons"></div>
       <div class="server-icon add" id="btn-add-server" title="Adicionar servidor">+</div>
     </div>
 
     <div id="channel-sidebar">
-      <div id="server-cover"></div>
-      <div id="server-header">
-        <span id="server-name-label">Selecione um servidor</span>
-        <span class="gear" id="btn-edit-server" title="Editar servidor" style="cursor:pointer;">⚙️</span>
+      <div id="server-sidebar-content" style="display:flex; flex-direction:column; flex:1; overflow:hidden;">
+        <div id="server-cover"></div>
+        <div id="server-header">
+          <span id="server-name-label">Selecione um servidor</span>
+          <span class="gear" id="btn-edit-server" title="Editar servidor" style="cursor:pointer;">⚙️</span>
+        </div>
+        <div id="channel-list"></div>
       </div>
-      <div id="channel-list"></div>
+
+      <div id="dm-sidebar-content" style="display:none;">
+        <div id="dm-sidebar-header">Mensagens diretas</div>
+        <div id="add-friend-row">
+          <input type="text" id="add-friend-username" placeholder="nome de usuário">
+          <button class="btn" id="btn-send-friend-request">Adicionar</button>
+        </div>
+        <div id="friend-request-error" style="color:var(--danger); font-size:12px; margin:6px 12px 0;"></div>
+        <div id="friend-list-wrap"></div>
+      </div>
+
       <div id="user-bar">
         <div class="avatar" id="my-avatar"></div>
         <div class="uname" id="my-username">...</div>
@@ -193,12 +227,16 @@
     <div id="content-area">
       <div id="content-header" style="display:none;">
         <span id="content-header-title"></span>
+        <div id="dm-view-toggle" style="display:none; gap:4px; margin-left:10px;">
+          <button class="tab-btn active" id="btn-dm-tab-messages" style="flex:none; padding:5px 12px; font-size:12px; border-radius:8px;">💬 Mensagens</button>
+          <button class="tab-btn" id="btn-dm-tab-call" style="flex:none; padding:5px 12px; font-size:12px; border-radius:8px;">🎙️ Chamada</button>
+        </div>
         <button id="btn-toggle-members" title="Ver membros">👥</button>
       </div>
 
       <div id="empty-state">
         <div style="font-size:40px;">👋</div>
-        <div>Crie ou entre em um servidor para começar</div>
+        <div id="empty-state-text">Crie ou entre em um servidor para começar</div>
       </div>
 
       <div id="text-view">
@@ -206,6 +244,14 @@
         <div id="message-input-row">
           <input type="text" id="message-text" placeholder="Enviar mensagem...">
           <button class="btn" style="width:auto; padding:10px 18px;" id="btn-send-message">Enviar</button>
+        </div>
+      </div>
+
+      <div id="dm-view">
+        <div id="dm-messages"></div>
+        <div id="dm-message-input-row">
+          <input type="text" id="dm-message-text" placeholder="Enviar mensagem...">
+          <button class="btn" style="width:auto; padding:10px 18px;" id="btn-send-dm-message">Enviar</button>
         </div>
       </div>
 
