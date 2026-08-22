@@ -135,6 +135,7 @@ async function onLoggedIn(user){
   renderUserBar();
   await loadServers();
   subscribeToDmInbox();
+  subscribeToUserEvents();
   await loadFriendsAndRequests();
 }
 
@@ -416,12 +417,128 @@ async function loadServers(){
     servers = data || [];
   }
   state.servers = servers;
+
+  // Se eu tava vendo um servidor que não existe mais pra mim (fui removido/ele foi excluído), sai dele
+  if(state.currentServerId && !servers.find(s => s.id === state.currentServerId)){
+    state.currentServerId = null;
+    state.currentChannelId = null;
+    if(state.messagesChannelSub){ sb.removeChannel(state.messagesChannelSub); state.messagesChannelSub = null; }
+    if(serverEventsSub){ sb.removeChannel(serverEventsSub); serverEventsSub = null; }
+    $("content-header").style.display = "none";
+    $("text-view").style.display = "none";
+    $("voice-view").style.display = "none";
+  }
+
   renderServerRail();
 
   if(servers.length && !state.currentServerId){
     selectServer(servers[0].id);
   } else if(!servers.length){
+    $("server-name-label").textContent = "Selecione um servidor";
+    $("channel-list").innerHTML = "";
+    $("empty-state-text").textContent = "Crie ou entre em um servidor para começar";
     $("empty-state").style.display = "flex";
+  }
+}
+
+// ============================================
+// TEMPO REAL — mantém tudo atualizado sem precisar de F5
+// ============================================
+
+// Coisas que dizem respeito a mim em qualquer servidor: pedidos de amizade
+// e ser adicionado/removido/ter meu cargo trocado em algum servidor.
+function subscribeToUserEvents(){
+  if(userEventsSub) return; // já ativa, uma inscrição basta pra toda a sessão
+  const myId = state.user.id;
+  userEventsSub = sb.channel("user-events-" + myId)
+    .on("postgres_changes", { event: "*", schema: "public", table: "friend_requests", filter: `to_user=eq.${myId}` },
+      () => loadFriendsAndRequests())
+    .on("postgres_changes", { event: "*", schema: "public", table: "friend_requests", filter: `from_user=eq.${myId}` },
+      () => loadFriendsAndRequests())
+    .on("postgres_changes", { event: "INSERT", schema: "public", table: "server_members", filter: `user_id=eq.${myId}` },
+      () => loadServers())
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "server_members", filter: `user_id=eq.${myId}` },
+      () => loadServers())
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "server_members", filter: `user_id=eq.${myId}` },
+      async (payload) => {
+        // Meu cargo mudou no servidor que eu tô vendo agora
+        if(state.currentServerId && payload.new && payload.new.server_id === state.currentServerId){
+          state.myPermissions = await computeMyPermissions(state.currentServerId);
+          $("btn-edit-server").style.display = Object.values(state.myPermissions).some(Boolean) ? "" : "none";
+        }
+      })
+    // Alguém está me ligando (linha nova em `calls` com callee_id = eu)
+    .on("postgres_changes", { event: "INSERT", schema: "public", table: "calls", filter: `callee_id=eq.${myId}` },
+      (payload) => { if(payload.new.status === "ringing") showIncomingCall(payload.new); })
+    // Uma chamada que está tocando pra mim mudou (a pessoa cancelou antes de eu atender)
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "calls", filter: `callee_id=eq.${myId}` },
+      (payload) => handleIncomingCallUpdated(payload.new))
+    // Uma chamada que EU comecei mudou (a pessoa atendeu ou recusou)
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "calls", filter: `caller_id=eq.${myId}` },
+      (payload) => handleMyCallUpdated(payload.new))
+    .subscribe();
+}
+
+// Coisas que acontecem dentro de um servidor específico: canais, cargos, membros e o próprio servidor.
+// É trocada toda vez que você entra em outro servidor.
+function subscribeToServerEvents(serverId){
+  if(serverEventsSub){ sb.removeChannel(serverEventsSub); serverEventsSub = null; }
+
+  serverEventsSub = sb.channel("server-events-" + serverId)
+    .on("postgres_changes", { event: "*", schema: "public", table: "channels", filter: `server_id=eq.${serverId}` },
+      () => { if(state.currentServerId === serverId) reloadChannelsPreservingSelection(serverId); })
+    .on("postgres_changes", { event: "*", schema: "public", table: "roles", filter: `server_id=eq.${serverId}` },
+      async () => {
+        if(state.currentServerId !== serverId) return;
+        state.myPermissions = await computeMyPermissions(serverId);
+        $("btn-edit-server").style.display = Object.values(state.myPermissions).some(Boolean) ? "" : "none";
+        if($("modal-edit-server").classList.contains("active")) await loadRolesForEdit();
+        if($("member-list-panel").classList.contains("active")) loadServerMembers(serverId);
+      })
+    .on("postgres_changes", { event: "*", schema: "public", table: "server_members", filter: `server_id=eq.${serverId}` },
+      () => {
+        if(state.currentServerId !== serverId) return;
+        if($("member-list-panel").classList.contains("active")) loadServerMembers(serverId);
+      })
+    .on("postgres_changes", { event: "UPDATE", schema: "public", table: "servers", filter: `id=eq.${serverId}` },
+      (payload) => {
+        const idx = state.servers.findIndex(s => s.id === serverId);
+        if(idx !== -1) state.servers[idx] = payload.new;
+        renderServerRail();
+        if(state.currentServerId !== serverId) return;
+        $("server-name-label").textContent = payload.new.name;
+        const coverEl = $("server-cover");
+        coverEl.setAttribute("style", "" + serverCoverStyle(payload.new));
+        coverEl.classList.toggle("has-cover", !!payload.new.banner_url);
+        const codeEl = $("server-header").querySelector(".invite-code");
+        if(codeEl) codeEl.textContent = "código: " + payload.new.invite_code;
+      })
+    .on("postgres_changes", { event: "DELETE", schema: "public", table: "servers", filter: `id=eq.${serverId}` },
+      () => { if(state.currentServerId === serverId) loadServers(); })
+    .subscribe();
+}
+
+// Recarrega a lista de canais sem "chutar" o usuário de volta pro primeiro canal
+// se o canal que ele já estava vendo continuar existindo.
+async function reloadChannelsPreservingSelection(serverId){
+  const { data } = await sb.from("channels").select("*").eq("server_id", serverId).order("created_at");
+  state.channels = data || [];
+  renderChannelList();
+  if($("modal-edit-server").classList.contains("active")) renderEditChannelList();
+
+  const stillExists = state.channels.find(c => c.id === state.currentChannelId);
+  if(!stillExists){
+    const textChannels = state.channels.filter(c => c.type === "text");
+    if(textChannels.length){
+      selectChannel(textChannels[0]);
+    } else {
+      state.currentChannelId = null;
+      $("content-header").style.display = "none";
+      $("text-view").style.display = "none";
+      $("voice-view").style.display = "none";
+      $("empty-state-text").textContent = "Crie um canal para começar";
+      $("empty-state").style.display = "flex";
+    }
   }
 }
 
@@ -516,6 +633,7 @@ async function selectServer(serverId){
 
   await loadChannels(serverId);
   if($("member-list-panel").classList.contains("active")) loadServerMembers(serverId);
+  subscribeToServerEvents(serverId);
 }
 
 // ============================================
@@ -804,10 +922,12 @@ function showDmCallView(){
 
   const friend = state.serverMembersCache[state.currentDmUserId] || { username: "Usuário" };
   $("voice-channel-label").textContent = "Chamada com " + displayName(friend);
+  $("btn-join-voice").textContent = "📞 Ligar";
 
-  if(!isCurrentDmCallActive()){
+  if(!isCurrentDmCallActive() && callState.status === "idle"){
     $("voice-room").style.display = "none";
     $("voice-join-prompt").style.display = "flex";
+    $("voice-calling-status").style.display = "none";
   }
 }
 
@@ -865,6 +985,8 @@ $("btn-send-dm-message").addEventListener("click", sendDmMessage);
 $("dm-message-text").addEventListener("keydown", (e) => { if(e.key === "Enter") sendDmMessage(); });
 
 let dmInboxSub = null;
+let userEventsSub = null;
+let serverEventsSub = null;
 function subscribeToDmInbox(){
   if(dmInboxSub) return; // já ativa, uma inscrição basta pra toda a sessão
   dmInboxSub = sb.channel("dm-inbox-" + state.user.id)
@@ -1218,8 +1340,11 @@ function selectChannel(channel){
     state.voiceContext = { type: "channel", id: channel.id };
     $("text-view").style.display = "none";
     $("voice-view").style.display = "flex";
-    $("voice-join-prompt").style.display = "flex";
+    if(!voiceState.channel || voiceState.roomChannelId !== channel.id){
+      $("voice-join-prompt").style.display = "flex";
+    }
     $("voice-channel-label").textContent = channel.name;
+    $("btn-join-voice").textContent = "Entrar na chamada";
   }
 }
 
@@ -1305,7 +1430,28 @@ $("message-text").addEventListener("keydown", (e) => { if(e.key === "Enter") sen
 // Usa o padrão "perfect negotiation" para suportar ligar câmera/tela
 // no meio da chamada sem quebrar a conexão de ninguém.
 // ============================================
-const ICE_SERVERS = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] };
+// IMPORTANTE: com só STUN, a chamada só funciona bem quando as duas pessoas
+// estão em redes "fáceis" (mesmo Wi-Fi, sem firewall restritivo). Em internet
+// móvel, redes corporativas ou várias combinações de roteador, o STUN sozinho
+// não consegue abrir uma conexão direta — daí o sintoma de "conectou mas não
+// vem áudio/tela nenhuma". O TURN abaixo serve de retransmissor quando a
+// conexão direta falha. É um servidor TURN gratuito (Open Relay Project) —
+// dá pra trocar por outro provedor TURN próprio se precisar de mais volume.
+const ICE_SERVERS = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun1.l.google.com:19302" },
+    {
+      urls: [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp"
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject"
+    }
+  ]
+};
 
 let voiceState = {
   channel: null,        // canal Realtime do Supabase usado para sinalização
@@ -1320,12 +1466,194 @@ let voiceState = {
   videoStream: null,      // MediaStream da câmera ou da tela, o que estiver ativo
   videoSenders: {},        // peerId -> RTCRtpSender do vídeo
   selectedMicId: localStorage.getItem("agora_mic_device") || null,
+  selectedSpeakerId: localStorage.getItem("agora_speaker_device") || null,
+  hadPeer: false,          // já teve alguém conectado nesta chamada (pra saber se foi a pessoa que saiu, ou se ainda nem entrou)
 };
+
+// ============================================
+// TOQUE DE CHAMADA (gerado por código, sem precisar de arquivo de áudio)
+// ============================================
+let ringtoneCtx = null;
+let ringtoneTimer = null;
+
+function startRingtone(kind){ // kind: "outgoing" (chamando) | "incoming" (recebendo)
+  stopRingtone();
+  try{
+    ringtoneCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const freqs = kind === "outgoing" ? [480, 620] : [640, 950]; // tons diferentes pra distinguir quem liga de quem recebe
+    const beep = () => {
+      if(!ringtoneCtx) return;
+      const now = ringtoneCtx.currentTime;
+      freqs.forEach((f) => {
+        const osc = ringtoneCtx.createOscillator();
+        const gain = ringtoneCtx.createGain();
+        osc.frequency.value = f;
+        osc.type = "sine";
+        gain.gain.setValueAtTime(0, now);
+        gain.gain.linearRampToValueAtTime(0.16, now + 0.03);
+        gain.gain.linearRampToValueAtTime(0, now + (kind === "outgoing" ? 0.5 : 0.9));
+        osc.connect(gain).connect(ringtoneCtx.destination);
+        osc.start(now);
+        osc.stop(now + 1);
+      });
+    };
+    beep();
+    ringtoneTimer = setInterval(beep, kind === "outgoing" ? 1500 : 1700);
+  } catch(err){ console.warn("Não consegui tocar o som de chamada:", err.message); }
+}
+
+function stopRingtone(){
+  if(ringtoneTimer){ clearInterval(ringtoneTimer); ringtoneTimer = null; }
+  if(ringtoneCtx){ ringtoneCtx.close().catch(() => {}); ringtoneCtx = null; }
+}
+
+// ============================================
+// LIGAR / ATENDER / RECUSAR (chamadas 1:1 por DM)
+// ============================================
+// A "campainha" é uma linha na tabela `calls` (com Realtime ligado), o mesmo
+// mecanismo que já faz os pedidos de amizade e as mensagens de DM aparecerem
+// ao vivo sem precisar de F5. Muito mais confiável do que broadcast solto.
+let callState = { status: "idle", withUserId: null, callId: null, timeoutTimer: null }; // status: "idle" | "calling"
+let incomingCall = null; // linha da tabela `calls` que está tocando agora
+
+async function startOutgoingCall(targetUserId){
+  if(callState.status !== "idle" || voiceState.channel || incomingCall) return;
+  callState.status = "calling";
+  callState.withUserId = targetUserId;
+
+  const friend = state.serverMembersCache[targetUserId] || { username: "Usuário" };
+  $("voice-join-prompt").style.display = "none";
+  $("calling-avatar").innerHTML = avatarHtml(friend);
+  $("calling-status-text").textContent = "Chamando " + displayName(friend) + "...";
+  $("voice-calling-status").style.display = "flex";
+  startRingtone("outgoing");
+
+  const { data, error } = await sb.from("calls").insert({
+    caller_id: state.user.id, callee_id: targetUserId, status: "ringing"
+  }).select().single();
+
+  if(error){
+    console.error("Erro ao iniciar chamada:", error);
+    stopRingtone();
+    resetCallUi();
+    alert("Não consegui iniciar a chamada: " + error.message);
+    return;
+  }
+
+  callState.callId = data.id;
+  callState.timeoutTimer = setTimeout(() => {
+    if(callState.status === "calling") cancelOutgoingCall(true);
+  }, 30000);
+}
+
+async function cancelOutgoingCall(timedOut){
+  if(callState.timeoutTimer){ clearTimeout(callState.timeoutTimer); callState.timeoutTimer = null; }
+  if(callState.callId){
+    await sb.from("calls").update({ status: "cancelled" }).eq("id", callState.callId);
+  }
+  stopRingtone();
+  resetCallUi();
+  if(timedOut) alert("A pessoa não atendeu.");
+}
+
+function resetCallUi(){
+  callState = { status: "idle", withUserId: null, callId: null, timeoutTimer: null };
+  $("voice-calling-status").style.display = "none";
+  if(!isCurrentDmCallActive()){
+    $("voice-join-prompt").style.display = "flex";
+  }
+}
+
+// Chega quando ALGUÉM MEXEU numa chamada que EU comecei (aceitou ou recusou)
+function handleMyCallUpdated(call){
+  if(callState.status !== "calling" || call.id !== callState.callId) return;
+  if(call.status === "accepted") onCallAccepted(call);
+  else if(call.status === "rejected") onCallRejected(call);
+}
+
+function onCallAccepted(call){
+  if(callState.timeoutTimer){ clearTimeout(callState.timeoutTimer); callState.timeoutTimer = null; }
+  stopRingtone();
+  const targetUserId = callState.withUserId;
+  callState = { status: "idle", withUserId: null, callId: null, timeoutTimer: null };
+  $("voice-calling-status").style.display = "none";
+  state.voiceContext = { type: "dm", id: targetUserId };
+  joinVoiceChannel(dmRoomId(state.user.id, targetUserId));
+}
+
+function onCallRejected(call){
+  if(callState.timeoutTimer){ clearTimeout(callState.timeoutTimer); callState.timeoutTimer = null; }
+  stopRingtone();
+  resetCallUi();
+  alert("A chamada foi recusada.");
+}
+
+// Chega quando alguém me liga (linha nova em `calls` com callee_id = eu)
+async function showIncomingCall(call){
+  // Já em outra chamada, ligando, ou já tem uma chamada tocando: recusa automático (ocupado)
+  if(callState.status !== "idle" || voiceState.channel || incomingCall){
+    await sb.from("calls").update({ status: "rejected" }).eq("id", call.id);
+    return;
+  }
+
+  let caller = state.serverMembersCache[call.caller_id];
+  if(!caller){
+    const { data } = await sb.from("profiles").select("*").eq("id", call.caller_id).single();
+    caller = data || { username: "Usuário" };
+    state.serverMembersCache[call.caller_id] = caller;
+  }
+
+  incomingCall = call;
+  $("incoming-call-avatar").innerHTML = avatarHtml(caller);
+  $("incoming-call-name").textContent = displayName(caller);
+  $("incoming-call-overlay").classList.add("active");
+  startRingtone("incoming");
+}
+
+// Chega quando uma chamada que está tocando pra mim muda de status sem eu ter mexido
+// (o caso mais comum: a pessoa que ligou cancelou antes de eu atender)
+function handleIncomingCallUpdated(call){
+  if(incomingCall && incomingCall.id === call.id && call.status !== "ringing"){
+    hideIncomingCall();
+  }
+}
+
+function hideIncomingCall(){
+  $("incoming-call-overlay").classList.remove("active");
+  stopRingtone();
+  incomingCall = null;
+}
+
+$("btn-cancel-call").addEventListener("click", () => cancelOutgoingCall(false));
+
+$("btn-accept-call").addEventListener("click", async () => {
+  if(!incomingCall) return;
+  const call = incomingCall;
+  hideIncomingCall();
+  await sb.from("calls").update({ status: "accepted" }).eq("id", call.id);
+
+  state.voiceContext = { type: "dm", id: call.caller_id };
+  await joinVoiceChannel(dmRoomId(state.user.id, call.caller_id));
+
+  if(state.mode !== "dm"){
+    state.currentDmUserId = call.caller_id;
+    enterDmMode();
+  } else if(state.currentDmUserId !== call.caller_id){
+    await openDm(call.caller_id);
+  }
+  showDmCallView();
+});
+
+$("btn-decline-call").addEventListener("click", async () => {
+  if(!incomingCall) return;
+  const call = incomingCall;
+  hideIncomingCall();
+  await sb.from("calls").update({ status: "rejected" }).eq("id", call.id);
+});
 
 $("btn-join-voice").addEventListener("click", () => {
   if(state.mode === "dm" && state.currentDmUserId){
-    state.voiceContext = { type: "dm", id: state.currentDmUserId };
-    joinVoiceChannel(dmRoomId(state.user.id, state.currentDmUserId));
+    startOutgoingCall(state.currentDmUserId);
   } else {
     state.voiceContext = { type: "channel", id: state.currentChannelId };
     joinVoiceChannel(state.currentChannelId);
@@ -1396,7 +1724,14 @@ function handleVoicePresenceSync(presenceState){
     const info = presenceState[id][0];
     renderVoiceParticipant(id, info);
     createVoicePeerConnection(id);
+    voiceState.hadPeer = true;
   });
+
+  // Chamada privada (1:1): se a outra pessoa saiu da sala, encerra a chamada
+  // pros dois lados em vez de deixar essa ponta "pendurada" sozinha.
+  if(state.voiceContext && state.voiceContext.type === "dm" && voiceState.hadPeer && peerIds.length === 0){
+    leaveVoiceChannel();
+  }
 }
 
 // Regra combinada dos dois lados pra saber quem "cede" se as duas pontas
@@ -1415,6 +1750,15 @@ function createVoicePeerConnection(peerId){
 
   pc.onicecandidate = (e) => { if(e.candidate) sendVoiceSignal(peerId, "ice-candidate", e.candidate); };
 
+  // Se a conexão direta cair (rede instável, trocou de wifi pra 4G, etc.),
+  // tenta reabrir a conexão em vez de deixar a chamada muda/travada.
+  pc.oniceconnectionstatechange = () => {
+    if(pc.iceConnectionState === "failed"){
+      console.warn("Conexão de voz com", peerId, "falhou — tentando reconectar...");
+      try{ pc.restartIce(); } catch(err){ console.warn(err); }
+    }
+  };
+
   pc.ontrack = (e) => {
     if(e.track.kind === "audio"){
       let audioEl = voiceState.audioEls[peerId];
@@ -1423,8 +1767,10 @@ function createVoicePeerConnection(peerId){
         audioEl.autoplay = true;
         document.body.appendChild(audioEl);
         voiceState.audioEls[peerId] = audioEl;
+        applySpeakerToElement(audioEl);
       }
       audioEl.srcObject = e.streams[0] || new MediaStream([e.track]);
+      audioEl.play().catch(() => {}); // alguns navegadores exigem esse play() explícito
     } else if(e.track.kind === "video"){
       showRemoteVideo(peerId, e.streams[0] || new MediaStream([e.track]));
       e.track.onended = () => hideRemoteVideo(peerId);
@@ -1489,11 +1835,21 @@ function showRemoteVideo(peerId, stream){
   if(!card) return;
   let video = card.querySelector("video");
   if(!video){
+    const wrap = document.createElement("div");
+    wrap.className = "video-wrap";
     video = document.createElement("video");
     video.autoplay = true;
     video.playsInline = true;
     video.muted = true; // o áudio já toca pelo elemento <audio> separado
-    card.insertBefore(video, card.firstChild);
+    const maxBtn = document.createElement("button");
+    maxBtn.className = "video-maximize-btn";
+    maxBtn.type = "button";
+    maxBtn.title = "Maximizar";
+    maxBtn.textContent = "⛶";
+    maxBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleMaximizeVideo(peerId); });
+    wrap.appendChild(video);
+    wrap.appendChild(maxBtn);
+    card.insertBefore(wrap, card.firstChild);
   }
   video.srcObject = stream;
   card.classList.add("has-video");
@@ -1502,8 +1858,9 @@ function showRemoteVideo(peerId, stream){
 function hideRemoteVideo(peerId){
   const card = document.getElementById("voice-p-" + peerId);
   if(!card) return;
-  const video = card.querySelector("video");
-  if(video) video.remove();
+  if(card.classList.contains("maximized")) toggleMaximizeVideo(peerId);
+  const wrap = card.querySelector(".video-wrap");
+  if(wrap) wrap.remove();
   card.classList.remove("has-video");
 }
 
@@ -1513,18 +1870,56 @@ function updateLocalVideoPreview(stream){
   let video = card.querySelector("video");
   if(stream){
     if(!video){
+      const wrap = document.createElement("div");
+      wrap.className = "video-wrap";
       video = document.createElement("video");
       video.autoplay = true;
       video.playsInline = true;
       video.muted = true;
-      card.insertBefore(video, card.firstChild);
+      const maxBtn = document.createElement("button");
+      maxBtn.className = "video-maximize-btn";
+      maxBtn.type = "button";
+      maxBtn.title = "Maximizar";
+      maxBtn.textContent = "⛶";
+      maxBtn.addEventListener("click", (e) => { e.stopPropagation(); toggleMaximizeVideo(voiceState.myId); });
+      wrap.appendChild(video);
+      wrap.appendChild(maxBtn);
+      card.insertBefore(wrap, card.firstChild);
     }
     video.srcObject = stream;
     card.classList.add("has-video");
   } else {
-    if(video) video.remove();
+    if(card.classList.contains("maximized")) toggleMaximizeVideo(voiceState.myId);
+    const wrap = card.querySelector(".video-wrap");
+    if(wrap) wrap.remove();
     card.classList.remove("has-video");
   }
+}
+
+// Alterna a visualização em tela cheia (dentro do app) de um vídeo específico.
+// Fecha automaticamente com a tecla Esc.
+function toggleMaximizeVideo(peerId){
+  const card = document.getElementById("voice-p-" + peerId);
+  if(!card || !card.classList.contains("has-video")) return;
+  const container = $("voice-participants");
+  const isMaximized = card.classList.contains("maximized");
+
+  if(isMaximized){
+    card.classList.remove("maximized");
+    container.classList.remove("has-maximized");
+    document.removeEventListener("keydown", handleMaximizeEscKey);
+  } else {
+    document.querySelectorAll(".voice-participant.maximized").forEach(el => el.classList.remove("maximized"));
+    card.classList.add("maximized");
+    container.classList.add("has-maximized");
+    document.addEventListener("keydown", handleMaximizeEscKey);
+  }
+}
+
+function handleMaximizeEscKey(e){
+  if(e.key !== "Escape") return;
+  const maximized = document.querySelector(".voice-participant.maximized");
+  if(maximized) toggleMaximizeVideo(maximized.id.replace("voice-p-", ""));
 }
 
 function removeVoicePeer(peerId){
@@ -1615,37 +2010,84 @@ async function toggleScreenShare(){
   }
 }
 
+// Aplica o alto-falante escolhido a um elemento <audio>/<video>, se o navegador suportar.
+async function applySpeakerToElement(el){
+  if(!voiceState.selectedSpeakerId) return;
+  if(typeof el.setSinkId !== "function") return; // Safari/iOS ainda não suporta
+  try{ await el.setSinkId(voiceState.selectedSpeakerId); }
+  catch(err){ console.warn("Não foi possível trocar a saída de áudio:", err.message); }
+}
+
+function applySpeakerToAllAudio(){
+  Object.values(voiceState.audioEls).forEach(applySpeakerToElement);
+}
+
 async function openMicSettings(){
+  const supportsOutputSelection = typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype;
   try{
     const devices = await navigator.mediaDevices.enumerateDevices();
     const mics = devices.filter(d => d.kind === "audioinput");
-    const select = $("mic-select");
-    select.innerHTML = "";
+    const speakers = devices.filter(d => d.kind === "audiooutput");
+
+    const micSelect = $("mic-select");
+    micSelect.innerHTML = "";
     mics.forEach((m, i) => {
       const opt = document.createElement("option");
       opt.value = m.deviceId;
       opt.textContent = m.label || `Microfone ${i + 1}`;
       if(m.deviceId === voiceState.selectedMicId) opt.selected = true;
-      select.appendChild(opt);
+      micSelect.appendChild(opt);
     });
+
+    const speakerSelect = $("speaker-select");
+    speakerSelect.innerHTML = "";
+    if(supportsOutputSelection && speakers.length){
+      speakerSelect.disabled = false;
+      speakers.forEach((s, i) => {
+        const opt = document.createElement("option");
+        opt.value = s.deviceId;
+        opt.textContent = s.label || `Alto-falante ${i + 1}`;
+        if(s.deviceId === voiceState.selectedSpeakerId) opt.selected = true;
+        speakerSelect.appendChild(opt);
+      });
+      $("speaker-settings-note").textContent = "";
+    } else {
+      speakerSelect.disabled = true;
+      const opt = document.createElement("option");
+      opt.textContent = "Não suportado neste navegador";
+      speakerSelect.appendChild(opt);
+      $("speaker-settings-note").textContent = supportsOutputSelection
+        ? "Nenhum alto-falante extra foi detectado."
+        : "Seu navegador não permite escolher a saída de áudio (comum no Safari/iOS). O som sai pelo dispositivo padrão do sistema.";
+    }
+
     $("mic-settings-note").textContent = mics.some(m => m.label)
       ? ""
       : "Os nomes dos microfones aparecem depois que você permitir o uso do microfone pela primeira vez.";
     $("modal-mic-settings").classList.add("active");
   } catch(err){
-    alert("Não consegui listar os microfones: " + err.message);
+    alert("Não consegui listar os dispositivos de áudio: " + err.message);
   }
 }
 
 $("btn-apply-mic").addEventListener("click", async () => {
-  const deviceId = $("mic-select").value;
-  if(!deviceId) { $("modal-mic-settings").classList.remove("active"); return; }
-  voiceState.selectedMicId = deviceId;
-  localStorage.setItem("agora_mic_device", deviceId);
+  const micDeviceId = $("mic-select").value;
+  const speakerSelect = $("speaker-select");
+  const speakerDeviceId = !speakerSelect.disabled ? speakerSelect.value : null;
+
+  if(speakerDeviceId){
+    voiceState.selectedSpeakerId = speakerDeviceId;
+    localStorage.setItem("agora_speaker_device", speakerDeviceId);
+    applySpeakerToAllAudio();
+  }
+
+  if(!micDeviceId){ $("modal-mic-settings").classList.remove("active"); return; }
+  voiceState.selectedMicId = micDeviceId;
+  localStorage.setItem("agora_mic_device", micDeviceId);
 
   if(voiceState.localStream){
     try{
-      const newStream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: deviceId } } });
+      const newStream = await navigator.mediaDevices.getUserMedia({ audio: { deviceId: { exact: micDeviceId } } });
       const newTrack = newStream.getAudioTracks()[0];
       const oldTrack = voiceState.localStream.getAudioTracks()[0];
       newTrack.enabled = !voiceState.muted;
@@ -1669,15 +2111,20 @@ function leaveVoiceChannel(){
   if(voiceState.localStream) voiceState.localStream.getTracks().forEach(t => t.stop());
   if(voiceState.videoTrack) voiceState.videoTrack.stop();
   if(voiceState.channel) sb.removeChannel(voiceState.channel);
+  document.removeEventListener("keydown", handleMaximizeEscKey);
+  $("voice-participants").classList.remove("has-maximized");
 
   const keepMicId = voiceState.selectedMicId;
+  const keepSpeakerId = voiceState.selectedSpeakerId;
   voiceState = {
     channel: null, localStream: null, peers: {}, audioEls: {}, myId: null, muted: false, roomChannelId: null,
-    videoTrack: null, videoKind: null, videoStream: null, videoSenders: {}, selectedMicId: keepMicId
+    videoTrack: null, videoKind: null, videoStream: null, videoSenders: {}, selectedMicId: keepMicId, selectedSpeakerId: keepSpeakerId,
+    hadPeer: false
   };
 
   $("voice-room").style.display = "none";
   $("voice-participants").innerHTML = "";
+  $("voice-calling-status").style.display = "none";
   $("voice-join-prompt").style.display = "flex";
   $("btn-toggle-mute").textContent = "🎤 Mutar";
   $("btn-toggle-camera").textContent = "📷 Ligar câmera";

@@ -2,8 +2,14 @@
 <html lang="pt-BR">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0a">
 <title>Viniul</title>
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192x192.png">
+<link rel="icon" type="image/png" sizes="512x512" href="icon-512x512.png">
+<meta property="og:image" content="/icon-1024.png">
 <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
 <style>
   :root{
@@ -127,9 +133,33 @@
   .voice-participant .vname{font-size:12px; text-align:center; color:var(--text-dim); word-break:break-word;}
   #voice-controls{padding:16px; display:flex; gap:10px; justify-content:center; flex-wrap:wrap; border-top:1px solid var(--bg-darkest);}
 
+  /* Maximizar vídeo (tela compartilhada ou câmera) */
+  .voice-participant.has-video{position:relative;}
+  .video-wrap{position:relative; width:100%;}
+  .video-wrap video{display:block;}
+  .video-maximize-btn{position:absolute; top:6px; right:6px; width:26px; height:26px; border-radius:6px; background:rgba(0,0,0,.55); color:#fff; border:none; display:flex; align-items:center; justify-content:center; cursor:pointer; font-size:13px; opacity:0; transition:opacity .15s ease;}
+  .video-wrap:hover .video-maximize-btn{opacity:1;}
+  #voice-participants.has-maximized{position:relative;}
+  #voice-participants.has-maximized .voice-participant:not(.maximized){display:none;}
+  .voice-participant.maximized{position:fixed !important; inset:0; width:100% !important; height:100%; z-index:60; background:#000; display:flex; align-items:center; justify-content:center; padding:0;}
+  .voice-participant.maximized .video-wrap{width:100%; height:100%; display:flex; align-items:center; justify-content:center;}
+  .voice-participant.maximized video{width:100%; height:100%; object-fit:contain; aspect-ratio:auto; border-radius:0;}
+  .voice-participant.maximized .vname{display:none;}
+  .voice-participant.maximized .video-maximize-btn{opacity:1; top:16px; right:16px; width:34px; height:34px; font-size:16px;}
+
   /* Modal */
   .modal-overlay{display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); align-items:center; justify-content:center; z-index:50;}
   .modal-overlay.active{display:flex;}
+
+  .call-overlay{display:none; position:fixed; inset:0; background:rgba(0,0,0,.78); align-items:center; justify-content:center; z-index:70;}
+  .call-overlay.active{display:flex;}
+  .call-box{background:var(--bg-dark); border-radius:16px; padding:32px; width:300px; text-align:center; box-shadow:0 20px 60px rgba(0,0,0,.5);}
+  .call-pulse{width:76px; height:76px; border-radius:50%; margin:0 auto; display:flex; align-items:center; justify-content:center; font-size:30px; background:var(--bg-light); animation: callPulse 1.4s ease-in-out infinite;}
+  @keyframes callPulse{
+    0%{ box-shadow:0 0 0 0 rgba(124,111,242,.5); }
+    70%{ box-shadow:0 0 0 18px rgba(124,111,242,0); }
+    100%{ box-shadow:0 0 0 0 rgba(124,111,242,0); }
+  }
   .modal-box{background:var(--bg-dark); border-radius:12px; padding:28px; width:340px;}
   .modal-box h2{font-size:18px; margin-bottom:16px;}
   .modal-box label{font-size:12px; color:var(--text-dim); display:block; margin:10px 0 4px;}
@@ -169,6 +199,61 @@
   .edit-channel-row .remove-x:hover{color:var(--danger);}
   .role-move-btn{color:var(--text-dim); cursor:pointer; font-size:10px; padding:2px 3px;}
   .role-move-btn:hover{color:var(--text);}
+
+  /* --- Botão voltar (só aparece no mobile) --- */
+  #btn-mobile-back{display:none; background:none; border:none; color:var(--text-dim); font-size:19px; cursor:pointer; padding:2px 10px 2px 0; line-height:1;}
+  #btn-mobile-back:hover{color:var(--text);}
+
+  /* ===================== MOBILE ===================== */
+  @media (max-width:768px){
+    body{height:100dvh;}
+    #app, #main-screen, #main-screen.active{height:100dvh;}
+    #auth-screen{height:100dvh; padding:20px;}
+    .auth-box{width:100%; max-width:380px; padding:28px 22px;}
+
+    #main-screen.active{position:relative; overflow:hidden;}
+
+    /* Trilho de servidores mais estreito */
+    #server-rail{width:58px; padding:10px 0;}
+    .server-icon{width:40px; height:40px; border-radius:20px; font-size:13px;}
+    .server-icon:hover, .server-icon.active{border-radius:13px;}
+
+    /* Sidebar de canais/DMs ocupa o resto da tela */
+    #channel-sidebar{width:calc(100% - 58px); flex-shrink:0;}
+
+    /* Área de conteúdo ocupa a tela toda quando ativa */
+    #content-area{width:calc(100% - 58px);}
+
+    /* Só um "painel" visível por vez: sidebar OU conteúdo */
+    #main-screen:not(.mobile-chat-active) #content-area{display:none !important;}
+    #main-screen.mobile-chat-active #channel-sidebar{display:none !important;}
+
+    #btn-mobile-back{display:inline-flex; align-items:center; justify-content:center;}
+    #content-header{padding:12px 14px;}
+    #content-header-title{font-size:14px;}
+
+    /* Painel de membros vira uma gaveta sobre a tela */
+    #member-list-panel.active{position:fixed; top:0; right:0; bottom:0; width:82%; max-width:300px; z-index:30; box-shadow:-10px 0 30px rgba(0,0,0,.55);}
+
+    /* Modais ocupando melhor telas pequenas */
+    .modal-box{width:90vw; max-width:340px; padding:22px; max-height:86dvh; overflow-y:auto;}
+
+    #message-input-row, #dm-message-input-row{padding:10px 12px; gap:8px;}
+    #channel-list, #friend-list-wrap{padding:8px;}
+    #server-header{padding:14px;}
+
+    .voice-participant{width:76px;}
+    .voice-participant.has-video{width:100%;}
+    #voice-controls{padding:12px;}
+    #voice-controls .btn{padding:10px 14px; font-size:12px;}
+  }
+
+  @media (max-width:380px){
+    .server-icon{width:36px; height:36px;}
+    #server-rail{width:52px;}
+    #channel-sidebar{width:calc(100% - 52px);}
+    #content-area{width:calc(100% - 52px);}
+  }
 </style>
 </head>
 <body>
@@ -226,6 +311,7 @@
 
     <div id="content-area">
       <div id="content-header" style="display:none;">
+        <button id="btn-mobile-back" title="Voltar">←</button>
         <span id="content-header-title"></span>
         <div id="dm-view-toggle" style="display:none; gap:4px; margin-left:10px;">
           <button class="tab-btn active" id="btn-dm-tab-messages" style="flex:none; padding:5px 12px; font-size:12px; border-radius:8px;">💬 Mensagens</button>
@@ -260,7 +346,12 @@
           <div style="font-size:40px;">🎙️</div>
           <div id="voice-channel-label" style="color:var(--text-dim);"></div>
           <button class="btn" style="width:auto; padding:12px 28px;" id="btn-join-voice">Entrar na chamada</button>
-          <button class="link-btn" id="btn-mic-settings-prejoin">⚙️ Escolher microfone</button>
+          <button class="link-btn" id="btn-mic-settings-prejoin">⚙️ Configurar áudio</button>
+        </div>
+        <div id="voice-calling-status" style="display:none; flex:1; flex-direction:column; align-items:center; justify-content:center; gap:16px;">
+          <div class="avatar call-pulse" id="calling-avatar" style="width:80px; height:80px; font-size:32px;"></div>
+          <div id="calling-status-text" style="color:var(--text-dim);"></div>
+          <button class="btn danger" style="width:auto; padding:12px 28px;" id="btn-cancel-call">Cancelar</button>
         </div>
         <div id="voice-room" style="display:none; flex:1; flex-direction:column;">
           <div id="voice-participants"></div>
@@ -268,7 +359,7 @@
             <button class="btn secondary" id="btn-toggle-mute">🎤 Mutar</button>
             <button class="btn secondary" id="btn-toggle-camera">📷 Ligar câmera</button>
             <button class="btn secondary" id="btn-share-screen">🖥️ Compartilhar tela</button>
-            <button class="btn secondary" id="btn-mic-settings">⚙️ Microfone</button>
+            <button class="btn secondary" id="btn-mic-settings">⚙️ Áudio</button>
             <button class="btn danger" id="btn-leave-voice">Sair da chamada</button>
           </div>
         </div>
@@ -277,17 +368,33 @@
 
     <div id="member-list-panel"></div>
 
-<!-- MODAL: microphone settings -->
+<!-- MODAL: audio settings (mic + speaker) -->
 <div class="modal-overlay" id="modal-mic-settings">
   <div class="modal-box">
     <span class="modal-close-x" data-close="modal-mic-settings">✕</span>
-    <h2>Escolher microfone</h2>
-    <label>Microfone</label>
+    <h2>Configurar áudio</h2>
+    <label>Microfone (entrada)</label>
     <select id="mic-select" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--bg-light); background:var(--bg-mid); color:var(--text); font-size:14px;"></select>
+    <label style="margin-top:14px;">Alto-falante (saída)</label>
+    <select id="speaker-select" style="width:100%; padding:10px 12px; border-radius:8px; border:1px solid var(--bg-light); background:var(--bg-mid); color:var(--text); font-size:14px;"></select>
+    <div id="speaker-settings-note" style="font-size:12px; color:var(--text-dim); margin-top:6px;"></div>
     <div id="mic-settings-note" style="font-size:12px; color:var(--text-dim); margin-top:8px;"></div>
-    <div class="modal-actions"><button class="btn" id="btn-apply-mic">Usar este microfone</button></div>
+    <div class="modal-actions"><button class="btn" id="btn-apply-mic">Salvar</button></div>
   </div>
 </div>
+  </div>
+</div>
+
+<!-- CHAMADA RECEBIDA (overlay global, não fecha clicando fora) -->
+<div class="call-overlay" id="incoming-call-overlay">
+  <div class="call-box">
+    <div class="avatar call-pulse" id="incoming-call-avatar"></div>
+    <div id="incoming-call-name" style="font-size:18px; font-weight:600; margin-top:14px;"></div>
+    <div style="color:var(--text-dim); font-size:13px; margin-top:4px;">Chamada de voz recebida</div>
+    <div style="display:flex; gap:12px; margin-top:24px;">
+      <button class="btn danger" style="width:auto; flex:1;" id="btn-decline-call">Recusar</button>
+      <button class="btn" style="width:auto; flex:1; background:var(--online);" id="btn-accept-call">Atender</button>
+    </div>
   </div>
 </div>
 
@@ -461,5 +568,32 @@
 
 <script src="config.js"></script>
 <script src="app.js"></script>
+<script>
+// Navegação mobile: mostra a lista (canais/DMs) OU a conversa, nunca as duas juntas.
+// Não depende do conteúdo do app.js — funciona por cima, ouvindo os cliques na tela.
+(function(){
+  var mainScreen = document.getElementById('main-screen');
+  if(!mainScreen) return;
+
+  function isMobile(){ return window.innerWidth <= 768; }
+  function enterChat(){ if(isMobile()) mainScreen.classList.add('mobile-chat-active'); }
+  function exitChat(){ mainScreen.classList.remove('mobile-chat-active'); }
+
+  document.addEventListener('click', function(e){
+    if(e.target.closest('#btn-mobile-back')){
+      exitChat();
+      return;
+    }
+    // Abriu um canal (texto/voz) ou uma conversa com um amigo -> mostra a conversa em tela cheia
+    if(e.target.closest('.channel-item') || e.target.closest('.friend-row')){
+      enterChat();
+    }
+  });
+
+  window.addEventListener('resize', function(){
+    if(!isMobile()) exitChat();
+  });
+})();
+</script>
 </body>
 </html>
